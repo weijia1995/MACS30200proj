@@ -1,0 +1,322 @@
+---
+title: "PS3 Regression diagnostics, interaction terms, and missing data"
+author: "Weijia Li"
+output:   
+  github_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE,
+                      warning = FALSE,
+                      echo = FALSE)
+library(tidyverse)
+library(forcats)
+library(broom)
+library(modelr)
+library(stringr)
+library(rcfss)
+library(haven)
+library(car)
+library(lmtest)
+library(coefplot)
+library(RColorBrewer)
+library(GGally)
+library(Amelia)
+library(MVN)
+theme_set(theme_minimal())
+biden <- read_csv("biden.csv") %>%
+  mutate(obs_num = as.numeric(rownames(.)))
+
+biden_omit <- biden %>%
+  na.omit()
+
+(lm_biden <- biden_omit %>%
+  lm(biden ~ age + female + educ, data = .))
+```
+
+
+# Regression diagnostic
+
+### 1. Unusual and/or influential observations
+
+I first draw a bubble plot to visualise leverage, discrepancy and influence. Cooks's D values are marked in red.
+
+```{r 1.1}
+inf_bar <- 4 / (nrow(biden_omit) - length(coef(lm_biden)) - 1 -1)
+
+biden_diag <- biden_omit %>%
+  mutate(hat = hatvalues(lm_biden),
+         student = rstudent(lm_biden),
+         coosd = cooks.distance(lm_biden))
+
+odd <- biden_diag %>%
+  filter(hat >= 2 * mean(hat) | 
+           abs(student) > 2 | 
+           coosd > inf_bar) %>%
+  mutate(high_cooks = ifelse(coosd > inf_bar, "high_cooks", "otherwise"))
+
+# Bubble Plot
+ggplot(odd, aes(hat, student)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_point(aes(size = coosd, color = high_cooks), shape = 1) +
+  scale_size_continuous(range = c(1, 20)) +
+  geom_vline(xintercept = 2 * mean(biden_diag$hat), color = "red", linetype = "dashed") + 
+  geom_hline(yintercept = 2, color = "red", linetype = "dashed") + 
+  geom_hline(yintercept = -2, color = "red", linetype = "dashed") + 
+  labs(title = "Bubble Plot",
+       subtitle = "Red Indicates High Cooks D",
+       x = "Leverage",
+       y = "Studentized residual") +
+  theme(legend.position = "none")
+
+```
+
+From the bubble plot, we can see there are `r nrow(odd)` values with high values of leverage, discrepancy, or influence. I am plotting histograms for biden score, age, education level, party affiliation, and gender to see whether these points have high values due to unusual.
+
+```{r 1.1-hist}
+biden_diag <- biden_diag %>%
+  mutate(`Unusual or Influential` = ifelse(obs_num %in% odd$obs_num, "Yes", "No"))
+
+biden_diag %>% 
+  ggplot(aes(age, fill = `Unusual or Influential`)) +
+    geom_histogram(bins = 10) + 
+    labs(title = "Age",
+         subtitle = "All Observations with High Leverage, Discrepancy, or Influence",
+         x = "Age",
+         y = "Count")
+        
+biden_diag %>% 
+  ggplot(aes(biden, fill = `Unusual or Influential`)) +
+    geom_histogram(bins = 10) + 
+    labs(title = "Biden Warmth Score",
+         x = "Score",
+         y = "Count")
+
+biden_diag %>% 
+  mutate(female = ifelse(female == 1, "Female", "Male")) %>%
+  ggplot(aes(female, fill = `Unusual or Influential`)) +
+    geom_histogram(stat = "count", bins = 10) + 
+    labs(title = "Gender",
+         x = "Gender",
+         y = "Count")
+
+biden_diag %>% 
+  mutate(party = ifelse(dem == 1, "Democrat", 
+                        ifelse(rep == 1, "Republican",
+                               "Independent"))) %>%
+  ggplot(aes(party, fill = `Unusual or Influential`)) +
+    geom_histogram(stat = "count", bins = 10) + 
+    labs(title = "Party Affiliation",
+         x = "Party",
+         y = "Count")
+```
+
+There are more unusual or inflential results in groups of old, male, low biden score, and Republicans. Thus I want to improve my model by including interaction terms between Republicans party affiliation and age for further research. Republican party affiliation was not included in the original model so I should first add $Rep$ as a predictor to my model.
+
+### 2. Non-normally distributed errors
+
+```{r 1.2}
+car::qqPlot(lm_biden,
+            ylab = "Studentized Residuals")
+```
+
+From the normal quantile plot, we can see a clear deviation of the residuels from normal distribution. I thus use a 2-power transformation to make the errors of the model more normal. 
+
+```{r 1.2-correct}
+temp <- biden_omit %>%
+      mutate(biden_power = (biden ^ 2))
+
+biden_power <- temp %>%
+  lm(biden_power ~ age + female + educ, data = .)
+
+car::qqPlot(biden_power, main = "Normal QQ Plot for Linear Model with Power Ladder 2",
+            ylab = "Studentized Residuals") 
+```
+
+### 3. Heteroscedasticity
+
+```{r hetero}
+biden_omit %>%
+  add_predictions(lm_biden) %>%
+  add_residuals(lm_biden) %>%
+  ggplot(aes(pred, resid)) +
+  geom_point(alpha = .2) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_quantile(method = "rqss", lambda = 5, quantiles = c(.05, .95)) +
+  labs(title = "Homoscedastic variance of error terms",
+       x = "Predicted values",
+       y = "Residuals")
+
+bptest(lm_biden)
+```
+
+By plotting the results of a Breusch-Pagan test, we can see that heteroscedasticity does present. The heteroscedasticity could misinterpret the estimates for the standard error for each coefficient.
+
+### 4. Multicollinearity
+
+```{r multi_colin}
+car::vif(lm_biden)
+```
+
+Looking at the variance inflation factor(VIF), since none of the VIFs is above 10, there is no multicollinearity in the model.
+
+# Interaction Terms 
+
+```{r lm_inter}
+(lm_inter <- biden_omit %>%
+  lm(biden ~ age + educ + age * educ, data = .))
+```
+
+### 1. Marginal effect of age on Joe Biden thermometer rating, conditional on education. 
+
+```{r 2.1}
+instant_effect <- function(model, mod_var){
+  # get interaction term name
+  int.name <- names(model$coefficients)[[which(str_detect(names(model$coefficients), ":"))]]
+  marg_var <- str_split(int.name, ":")[[1]][[which(str_split(int.name, ":")[[1]] != mod_var)]]
+  # store coefficients and covariance matrix
+  beta.hat <- coef(model)
+  cov <- vcov(model)
+  # possible set of values for mod_var
+  if(class(model)[[1]] == "lm"){
+    z <- seq(min(model$model[[mod_var]]), max(model$model[[mod_var]]))
+  } else {
+    z <- seq(min(model$data[[mod_var]]), max(model$data[[mod_var]]))
+  }
+  # calculate instantaneous effect
+  dy.dx <- beta.hat[[marg_var]] + beta.hat[[int.name]] * z
+  # calculate standard errors for instantaeous effect
+  se.dy.dx <- sqrt(cov[marg_var, marg_var] +
+                     z^2 * cov[int.name, int.name] +
+                     2 * z * cov[marg_var, int.name])
+  # combine into data frame
+  data_frame(z = z,
+             dy.dx = dy.dx,
+             se = se.dy.dx)
+}
+
+instant_effect(lm_inter, "educ") %>%
+  ggplot(aes(z, dy.dx,
+             ymin = dy.dx - 1.96 * se,
+             ymax = dy.dx + 1.96 * se)) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(title = "Marginal effect of Age",
+       subtitle = "Conditional on Education",
+       x = "Education",
+       y = "Estimated marginal effect")
+
+
+linearHypothesis(lm_inter, "age + age:educ")
+```
+
+Since p-value is very small, the marginal effect of age is statistically significant. The effects is shown on the plot above.
+
+
+### 2. Marginal effect of education on Joe Biden thermometer rating, conditional on age. 
+
+```{r 2.2}
+instant_effect(lm_inter, "age") %>%
+  ggplot(aes(z, dy.dx,
+             ymin = dy.dx - 1.96 * se,
+             ymax = dy.dx + 1.96 * se)) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(title = "Marginal effect of Education",
+       subtitle = "Conditional on Age",
+       x = "Age",
+       y = "Estimated marginal effect")
+
+linearHypothesis(lm_inter, "educ + age:educ")
+```
+
+Again, the marginal effect is statistically significant at 0.05 significant level.
+
+# Missing Data
+
+```{r 3.1}
+biden_3 <- biden %>%
+  select(-female, -rep, -dem, -obs_num)
+uniPlot(biden_3, type = "qqplot")
+mardiaTest(biden_3, qqplot = FALSE)
+```
+
+By conducting a Mardia's MVN test, we can see that the predictors are not multivariate normal. I try to use square root transformation on age and education to improve the result.
+
+```{r 3.1-mulnorm-tran}
+biden_tran <- biden_3 %>%
+  mutate(sqrt_age = sqrt(age),
+         sqrt_educ = sqrt(educ))
+
+uniPlot(biden_tran, type = "qqplot")
+mardiaTest(biden_tran%>% select(sqrt_educ, sqrt_age), qqplot = FALSE)
+```
+
+```{r 3.2 missing}
+biden.miss <- biden %>%
+  mutate(dem = as.numeric(dem),
+         rep = as.numeric(rep)) %>%
+  amelia(., m=5, sqrts = c("age", "educ"),
+         noms = c("female", "dem", "rep"), p2s = 0)
+missmap(biden.miss)
+```
+
+```{r 3.2 compare} 
+models_imp <- data_frame(data = biden.miss$imputations) %>%
+  mutate(model = map(data, ~ lm(biden ~ age + female + educ,
+                                data = .x)),
+         coef = map(model, tidy)) %>%
+  unnest(coef, .id = "id")
+# models_imp
+
+mi.meld.plus <- function(df_tidy){
+  # transform data into appropriate matrix shape
+  coef.out <- df_tidy %>%
+    select(id:estimate) %>%
+    spread(term, estimate) %>%
+    select(-id)
+  
+  se.out <- df_tidy %>%
+    select(id, term, std.error) %>%
+    spread(term, std.error) %>%
+    select(-id)
+  
+  combined.results <- mi.meld(q = coef.out, se = se.out)
+  
+  data_frame(term = colnames(combined.results$q.mi),
+             estimate.mi = combined.results$q.mi[1, ],
+             std.error.mi = combined.results$se.mi[1, ])
+}
+
+plot <- bind_rows(orig = tidy(lm_biden),
+          mult_imp = mi.meld.plus(models_imp) %>%
+            rename(estimate = estimate.mi,
+                   std.error = std.error.mi),
+          .id = "method") %>%
+  mutate(method = factor(method, levels = c("orig", "mult_imp"),
+                         labels = c("Listwise deletion", "Multiple imputation")),
+         term = factor(term, levels = c("(Intercept)", "age",
+                                        "female", "educ"),
+                       labels = c("Intercept", "Age", "Female",
+                                  "Educ"))) %>%
+  filter(term != "Intercept")
+  
+plot %>%
+  ggplot(aes(fct_rev(term), estimate, color = fct_rev(method),
+             ymin = estimate - 1.96 * std.error,
+             ymax = estimate + 1.96 * std.error)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_pointrange(position = position_dodge(.75)) +
+  coord_flip() +
+  scale_color_discrete(guide = guide_legend(reverse = TRUE)) +
+  labs(title = "Comparing regression results",
+       subtitle = "Omitting intercept from plot",
+       x = NULL,
+       y = "Estimated parameter",
+       color = NULL) +
+  theme(legend.position = "bottom")
+
+```
+
+There is no statistically significant difference between the coefficients of the imputed linear model and the original model where rows with 'NA's are removed. This may due to the fact that the dataset do not have many missing values (From Missingness Map).
